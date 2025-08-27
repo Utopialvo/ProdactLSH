@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:17.2-alpine3.21
+    environment:
+      POSTGRES_DB: fast_rolsh_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  fastapi-server:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://postgres:password@postgres:5432/fast_rolsh_db
+      PYTHONPATH: /app
+      RELOAD: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./:/app  # Монтируем всю текущую директорию
+      - ./models:/app/models  # Монтируем директорию с моделями
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

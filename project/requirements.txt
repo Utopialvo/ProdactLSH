@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+asyncpg
+torch
+numpy
+scipy
+joblib
+pydantic
+python-multipart
+aiofiles
+python-dotenv
