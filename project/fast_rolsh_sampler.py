@@ -11,7 +11,8 @@ from asyncpg.pool import Pool
 import logging
 import math
 from scipy.spatial.distance import pdist
-from scipy import stats
+from scipy import integrate
+import random
 import itertools
 
 logger = logging.getLogger(__name__)
@@ -20,13 +21,27 @@ class FastRoLSHsampler:
     """
     Combined implementation of FastLSH and roLSH for batch data processing.
     Supports online learning with continuous state updates.
+    
+    FastLSH reduces dimensionality through random feature sampling:
+        h_{a,b}(v) = floor((a^T S(v) + b) / w)
+    where S(v) selects m random features from v.
+    
+    The collision probability is given by:
+        p(s,σ) = ∫_0^w f_{|sX|}(t) (1 - t/w) dt
+    where s = ||v - u||_2, and f_{|sX|} is the PDF of the absolute value
+    of the product of s and a standard normal variable X.
+    
+    roLSH optimizes search through adaptive radius selection:
+        R_new = { i2R + 2^x for 0 ≤ x ≤ log2(i2R)
+                  2^x       for x > log2(i2R) }
+    where i2R is the initial radius determined through query sampling.
     """
     
     def __init__(self, d: int, m: int = 100, k: int = 10, L: int = 10, w: float = 1.0,
                  dataset_id: Optional[int] = None, dataset_name: Optional[str] = None, 
                  db_pool: Optional[Pool] = None, distance_metric: str = "euclidean",
                  initial_radius: Optional[float] = None, radius_expansion: float = 2.0,
-                 sampling_ratio: float = 0.1):
+                 sampling_ratio: float = 0.1, optimization_interval: int = 10):
         # Core LSH parameters
         self.d = d  # Dimensionality of data vectors
         self.m = m  # Number of hash functions per table
@@ -41,6 +56,7 @@ class FastRoLSHsampler:
         self.initial_radius = initial_radius  # Initial search radius for roLSH
         self.radius_expansion = radius_expansion  # Radius expansion factor for roLSH
         self.sampling_ratio = sampling_ratio  # Feature sampling ratio for FastLSH
+        self.optimization_interval = optimization_interval  # How often to optimize parameters
         
         # Calculate number of features to sample (FastLSH)
         self.m_sampled = max(1, int(d * sampling_ratio))
@@ -51,6 +67,11 @@ class FastRoLSHsampler:
         self.batch_info = {}  # Information about processed batches
         self.last_update = None  # Time of last update
         self.radius_stats = {}  # Statistics for radius optimization
+        
+        # Reservoir sampling for parameter optimization
+        self.reservoir_sample = None
+        self.reservoir_size = 1000
+        self.batch_count = 0
         
         # Flags for data-dependent initialization
         self.is_initialized = False  # Whether model has been initialized with data
@@ -114,6 +135,14 @@ class FastRoLSHsampler:
                     # Add point to appropriate bucket in table
                     self.tables[l][hash_key].append(global_idx)
             
+            # Update reservoir sample for parameter optimization
+            self._update_reservoir_sample(batch_data)
+            self.batch_count += 1
+            
+            # Periodically optimize parameters
+            if self.batch_count % self.optimization_interval == 0:
+                await self.optimize_parameters()
+            
             # Update radius statistics for roLSH
             self._update_radius_stats(batch_data)
             
@@ -137,6 +166,23 @@ class FastRoLSHsampler:
         except Exception as e:
             logger.error(f"Error processing batch {batch_id}: {e}")
             return False
+
+    def _update_reservoir_sample(self, batch_data: torch.Tensor):
+        """Update reservoir sample with new batch data"""
+        if self.reservoir_sample is None:
+            self.reservoir_sample = batch_data.clone()
+        else:
+            for i in range(batch_data.size(0)):
+                idx = self.total_points + i
+                if idx < self.reservoir_size:
+                    # Add to reservoir if not full
+                    if self.reservoir_sample.size(0) < self.reservoir_size:
+                        self.reservoir_sample = torch.cat([self.reservoir_sample, batch_data[i:i+1]], dim=0)
+                    else:
+                        # Replace random element with decreasing probability
+                        r = random.randint(0, idx)
+                        if r < self.reservoir_size:
+                            self.reservoir_sample[r] = batch_data[i]
 
     async def _data_dependent_init(self):
         """Perform data-dependent initialization of parameters"""
@@ -569,65 +615,111 @@ class FastRoLSHsampler:
             'initial_radius': self.initial_radius,
             'radius_expansion': self.radius_expansion,
             'sampling_ratio': self.sampling_ratio,
-            'radius_stats': self.radius_stats
+            'radius_stats': self.radius_stats,
+            'reservoir_sample_size': self.reservoir_sample.size(0) if self.reservoir_sample is not None else 0
         }
+
+    def _p_elastic(self, s: float, w: float) -> float:
+        """
+        Compute collision probability for FastLSH using numerical integration.
+        
+        Args:
+            s: Euclidean distance between vectors
+            w: Bucket width
+            
+        Returns:
+            p: Collision probability
+            
+        Theory:
+            For FastLSH, the effective distance is s_eff = s * sqrt(m/n)
+            The collision probability is:
+                p(s) = ∫_0^w (1/s_eff) * φ(t/s_eff) * (1 - t/w) dt
+            where φ is the standard normal PDF.
+        """
+        s_eff = s * math.sqrt(self.m_sampled / self.d)
+        
+        def integrand(t):
+            # Standard normal PDF
+            density = (1/s_eff) * math.exp(-0.5 * (t/s_eff)**2) / math.sqrt(2*math.pi)
+            return density * (1 - t/w)
+        
+        # Numerical integration
+        result, error = integrate.quad(integrand, 0, w)
+        return result
 
     async def optimize_parameters(self, sample_size: int = 1000) -> Dict[str, Any]:
         """
-        Optimize LSH parameters based on data characteristics.
+        Optimize LSH parameters based on theoretical guarantees.
         
-        Args:
-            sample_size: Number of points to use for parameter optimization
-            
-        Returns:
-            Dictionary with optimized parameters
+        Uses ρ = log(1/p1) / log(1/p2) to find optimal parameters,
+        where p1 and p2 are collision probabilities for distances R and cR.
         """
-        if self.total_points == 0:
-            return {"error": "No data available for optimization"}
+        if self.reservoir_sample is None or self.reservoir_sample.size(0) < 10:
+            return {"error": "Insufficient data for optimization"}
         
-        # Get a sample of points for analysis
-        sample_indices = torch.randint(0, self.total_points, (min(sample_size, self.total_points),))
-        sample_points = [self._get_point(i) for i in sample_indices]
+        X = self.reservoir_sample.cpu().numpy()
+        distances = []
         
-        if self.distance_metric == "euclidean":
-            # Analyze Euclidean distance distribution
-            distances = []
-            for i in range(len(sample_points)):
-                for j in range(i+1, len(sample_points)):
-                    dist = torch.norm(sample_points[i] - sample_points[j])
-                    distances.append(dist.item())
-            
-            # Optimize parameters based on distance distribution
-            if distances:
-                dist_array = np.array(distances)
-                self.w = np.percentile(dist_array, 25)  # 25th percentile
-                self.initial_radius = np.percentile(dist_array, 10)  # 10th percentile
+        # Calculate pairwise distances
+        for i in range(len(X)):
+            for j in range(i+1, len(X)):
+                if self.distance_metric == "euclidean":
+                    dist = np.linalg.norm(X[i] - X[j])
+                elif self.distance_metric == "cosine":
+                    norm_i = np.linalg.norm(X[i])
+                    norm_j = np.linalg.norm(X[j])
+                    if norm_i > 0 and norm_j > 0:
+                        cos_sim = np.dot(X[i], X[j]) / (norm_i * norm_j)
+                        dist = 1 - cos_sim
+                    else:
+                        dist = 1
+                distances.append(dist)
+        
+        if not distances:
+            return {"error": "No distances calculated"}
+        
+        # Find R as 10th percentile of distances
+        R = np.percentile(distances, 10)
+        c = 2  # Approximation ratio
+        cR = c * R
+        
+        # Optimize w using ρ minimization
+        best_w = self.w
+        best_rho = float('inf')
+        
+        # Test a range of w values
+        w_values = np.linspace(0.1 * R, 10 * R, 50)
+        for w_candidate in w_values:
+            try:
+                p1 = self._p_elastic(R, w_candidate)
+                p2 = self._p_elastic(cR, w_candidate)
                 
-        elif self.distance_metric == "cosine":
-            # Analyze cosine distance distribution
-            # Normalize points for cosine distance
-            norms = [torch.norm(p) for p in sample_points]
-            normalized_points = [p / n if n > 0 else p for p, n in zip(sample_points, norms)]
-            
-            cos_distances = []
-            for i in range(len(normalized_points)):
-                for j in range(i+1, len(normalized_points)):
-                    cos_sim = torch.dot(normalized_points[i], normalized_points[j])
-                    cos_dist = 1 - cos_sim.item()
-                    cos_distances.append(cos_dist)
-            
-            # Optimize parameters based on cosine distance distribution
-            if cos_distances:
-                cos_dist_array = np.array(cos_distances)
-                self.initial_radius = np.percentile(cos_dist_array, 25)  # 25th percentile
+                if p1 > 0 and p2 > 0 and p1 > p2:
+                    rho = math.log(1/p1) / math.log(1/p2)
+                    if rho < best_rho:
+                        best_rho = rho
+                        best_w = w_candidate
+            except:
+                continue
+        
+        # Update parameters
+        old_w = self.w
+        old_radius = self.initial_radius
+        
+        self.w = best_w
+        self.initial_radius = R * math.sqrt(self.m_sampled / self.d) / best_w
         
         # Reinitialize hash functions with new parameters
         self._init_hash_functions()
         
+        logger.info(f"Parameters optimized: w={old_w}->{self.w}, radius={old_radius}->{self.initial_radius}, ρ={best_rho}")
+        
         return {
             "w": self.w,
             "initial_radius": self.initial_radius,
-            "message": "Parameters optimized successfully"
+            "rho": best_rho,
+            "R": R,
+            "cR": cR
         }
     
     def _get_point(self, index: int) -> torch.Tensor:
@@ -671,6 +763,8 @@ class FastRoLSHsampler:
                 'radius_expansion': self.radius_expansion,
                 'sampling_ratio': self.sampling_ratio,
                 'radius_stats': self.radius_stats,
+                'reservoir_sample': self.reservoir_sample.cpu() if self.reservoir_sample is not None else None,
+                'batch_count': self.batch_count,
                 'tables': {f"{i}": dict(table) for i, table in enumerate(self.tables)}
             }
             
@@ -715,6 +809,10 @@ class FastRoLSHsampler:
             self.radius_expansion = state.get('radius_expansion', 2.0)
             self.sampling_ratio = state.get('sampling_ratio', 0.1)
             self.radius_stats = state.get('radius_stats', {})
+            self.reservoir_sample = state.get('reservoir_sample', None)
+            if self.reservoir_sample is not None:
+                self.reservoir_sample = self.reservoir_sample.to(self.device)
+            self.batch_count = state.get('batch_count', 0)
             
             # Restore tables
             self.tables = [defaultdict(list) for _ in range(self.L)]
