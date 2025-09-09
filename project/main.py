@@ -14,6 +14,8 @@ import json
 import os
 
 from fast_rolsh_sampler import FastRoLSHsampler
+from product_quantizer import BaseQuantizer, ProductQuantizer, AdvancedProductQuantizer, PQConfig
+from unified_quantization import UnifiedQuantizationEngine, UnifiedConfig
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -32,12 +34,23 @@ class DatasetCreate(BaseModel):
     initial_radius: Optional[float] = None  # Initial search radius for roLSH
     radius_expansion: Optional[float] = 2.0  # Radius expansion factor for roLSH
     sampling_ratio: Optional[float] = 0.1  # Feature sampling ratio for FastLSH
+    quantization_method: Optional[str] = "lsh"  # Quantization method: lsh, pq, hybrid
+    pq_num_subspaces: Optional[int] = 8  # Number of subspaces for PQ
+    pq_num_clusters: Optional[int] = 256  # Number of clusters per subspace for PQ
+    pq_use_diffusion: Optional[bool] = False  # Use diffusion maps for PQ
 
     @validator('distance_metric')
     def validate_distance_metric(cls, v):
         """Validate that distance metric is either 'euclidean' or 'cosine'"""
         if v not in ["euclidean", "cosine"]:
             raise ValueError("Distance metric must be 'euclidean' or 'cosine'")
+        return v
+    
+    @validator('quantization_method')
+    def validate_quantization_method(cls, v):
+        """Validate quantization method"""
+        if v not in ["lsh", "pq", "hybrid"]:
+            raise ValueError("Quantization method must be 'lsh', 'pq', or 'hybrid'")
         return v
 
 class BatchData(BaseModel):
@@ -62,6 +75,12 @@ class ModelSaveRequest(BaseModel):
     """Request model for saving model state"""
     dataset_name: str  # Name of the dataset
     filepath: str = "model_state.joblib"  # Path to save model state
+
+class QuantizationTrainRequest(BaseModel):
+    """Request model for training quantization"""
+    dataset_name: str  # Name of the dataset
+    method: str = "pq"  # Quantization method to train: pq or apq
+    use_diffusion: Optional[bool] = False  # Use diffusion maps for APQ
 
 # Global variables for model and database connection management
 models = {}  # Dictionary to store model instances by dataset name
@@ -89,7 +108,7 @@ async def lifespan(app: FastAPI):
 # Create FastAPI application with lifespan management
 app = FastAPI(
     title="FastRoLSH API", 
-    description="API for batch processing with FastRoLSH", 
+    description="API for batch processing with FastRoLSH and Product Quantization", 
     lifespan=lifespan
 )
 
@@ -98,26 +117,54 @@ async def load_existing_datasets():
     try:
         async with db_pool.acquire() as conn:
             # Query all datasets from database
-            datasets = await conn.fetch("SELECT id, name, dimension, m, k, L, w, distance_metric, initial_radius, radius_expansion, sampling_ratio FROM datasets")
+            datasets = await conn.fetch("SELECT id, name, dimension, m, k, L, w, distance_metric, initial_radius, radius_expansion, sampling_ratio, quantization_method, pq_num_subspaces, pq_num_clusters, pq_use_diffusion FROM datasets")
             
             # Initialize model for each dataset
             for dataset in datasets:
-                models[dataset['name']] = FastRoLSHsampler(
-                    d=dataset['dimension'],
-                    m=dataset['m'],
-                    k=dataset['k'],
-                    L=dataset['L'],
-                    w=dataset['w'],
-                    dataset_id=dataset['id'],
-                    dataset_name=dataset['name'],
-                    db_pool=db_pool,
-                    distance_metric=dataset['distance_metric'],
-                    initial_radius=dataset['initial_radius'],
-                    radius_expansion=dataset['radius_expansion'],
-                    sampling_ratio=dataset['sampling_ratio']
-                )
+                if dataset['quantization_method'] == 'lsh':
+                    models[dataset['name']] = FastRoLSHsampler(
+                        d=dataset['dimension'],
+                        m=dataset['m'],
+                        k=dataset['k'],
+                        L=dataset['L'],
+                        w=dataset['w'],
+                        dataset_id=dataset['id'],
+                        dataset_name=dataset['name'],
+                        db_pool=db_pool,
+                        distance_metric=dataset['distance_metric'],
+                        initial_radius=dataset['initial_radius'],
+                        radius_expansion=dataset['radius_expansion'],
+                        sampling_ratio=dataset['sampling_ratio']
+                    )
+                else:
+                    # Create unified quantization engine
+                    unified_config = UnifiedConfig(
+                        m=dataset['m'],
+                        k=dataset['k'],
+                        L=dataset['L'],
+                        w=dataset['w'],
+                        distance_metric=dataset['distance_metric'],
+                        initial_radius=dataset['initial_radius'],
+                        radius_expansion=dataset['radius_expansion'],
+                        sampling_ratio=dataset['sampling_ratio'],
+                        pq_num_subspaces=dataset['pq_num_subspaces'],
+                        pq_num_clusters=dataset['pq_num_clusters'],
+                        pq_use_diffusion=dataset['pq_use_diffusion'],
+                        hybrid_mode='hybrid' if dataset['quantization_method'] == 'hybrid' else 'pq_only'
+                    )
+                    
+                    models[dataset['name']] = UnifiedQuantizationEngine(
+                        d=dataset['dimension'],
+                        config=unified_config,
+                        dataset_id=dataset['id'],
+                        dataset_name=dataset['name'],
+                        db_pool=db_pool
+                    )
+                
                 # Load model state from database
-                await models[dataset['name']].load_state_from_db()
+                if isinstance(models[dataset['name']], FastRoLSHsampler):
+                    await models[dataset['name']].load_state_from_db()
+                # For unified engine, we need to load from file if exists
                 
         logger.info(f"Loaded {len(datasets)} datasets from database")
     except Exception as e:
@@ -131,7 +178,7 @@ async def get_db_connection():
 @app.get("/")
 async def root():
     """Root endpoint returning basic API information"""
-    return {"message": "FastRoLSH API Server"}
+    return {"message": "FastRoLSH API Server with Product Quantization"}
 
 @app.get("/health")
 async def health_check():
@@ -158,26 +205,55 @@ async def create_dataset(dataset: DatasetCreate, conn=Depends(get_db_connection)
         
         # Insert new dataset into database
         dataset_id = await conn.fetchval(
-            "INSERT INTO datasets (name, dimension, m, k, L, w, distance_metric, initial_radius, radius_expansion, sampling_ratio) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id",
+            """INSERT INTO datasets (name, dimension, m, k, L, w, distance_metric, initial_radius, 
+            radius_expansion, sampling_ratio, quantization_method, pq_num_subspaces, pq_num_clusters, pq_use_diffusion) 
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING id""",
             dataset.name, dataset.dimension, dataset.m, dataset.k, dataset.L, dataset.w, 
-            dataset.distance_metric, dataset.initial_radius, dataset.radius_expansion, dataset.sampling_ratio
+            dataset.distance_metric, dataset.initial_radius, dataset.radius_expansion, 
+            dataset.sampling_ratio, dataset.quantization_method, dataset.pq_num_subspaces,
+            dataset.pq_num_clusters, dataset.pq_use_diffusion
         )
         
-        # Initialize FastRoLSH model for the dataset
-        models[dataset.name] = FastRoLSHsampler(
-            d=dataset.dimension,
-            m=dataset.m,
-            k=dataset.k,
-            L=dataset.L,
-            w=dataset.w,
-            dataset_id=dataset_id,
-            dataset_name=dataset.name,
-            db_pool=db_pool,
-            distance_metric=dataset.distance_metric,
-            initial_radius=dataset.initial_radius,
-            radius_expansion=dataset.radius_expansion,
-            sampling_ratio=dataset.sampling_ratio
-        )
+        # Initialize appropriate model based on quantization method
+        if dataset.quantization_method == 'lsh':
+            models[dataset.name] = FastRoLSHsampler(
+                d=dataset.dimension,
+                m=dataset.m,
+                k=dataset.k,
+                L=dataset.L,
+                w=dataset.w,
+                dataset_id=dataset_id,
+                dataset_name=dataset.name,
+                db_pool=db_pool,
+                distance_metric=dataset.distance_metric,
+                initial_radius=dataset.initial_radius,
+                radius_expansion=dataset.radius_expansion,
+                sampling_ratio=dataset.sampling_ratio
+            )
+        else:
+            # Create unified quantization engine
+            unified_config = UnifiedConfig(
+                m=dataset.m,
+                k=dataset.k,
+                L=dataset.L,
+                w=dataset.w,
+                distance_metric=dataset.distance_metric,
+                initial_radius=dataset.initial_radius,
+                radius_expansion=dataset.radius_expansion,
+                sampling_ratio=dataset.sampling_ratio,
+                pq_num_subspaces=dataset.pq_num_subspaces,
+                pq_num_clusters=dataset.pq_num_clusters,
+                pq_use_diffusion=dataset.pq_use_diffusion,
+                hybrid_mode='hybrid' if dataset.quantization_method == 'hybrid' else 'pq_only'
+            )
+            
+            models[dataset.name] = UnifiedQuantizationEngine(
+                d=dataset.dimension,
+                config=unified_config,
+                dataset_id=dataset_id,
+                dataset_name=dataset.name,
+                db_pool=db_pool
+            )
         
         return {"dataset_id": dataset_id, "message": "Dataset created successfully"}
     except HTTPException:
@@ -212,11 +288,14 @@ async def process_batch(batch: BatchData, background_tasks: BackgroundTasks):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-async def process_batch_background(model: FastRoLSHsampler, tensor_data: torch.Tensor, batch_id: str, dataset_name: str):
+async def process_batch_background(model, tensor_data: torch.Tensor, batch_id: str, dataset_name: str):
     """Background task for processing a batch of data"""
     try:
         # Update model with new batch data
-        success = await model.update(tensor_data, batch_id)
+        if isinstance(model, FastRoLSHsampler):
+            success = await model.update(tensor_data, batch_id)
+        else:  # UnifiedQuantizationEngine
+            success = await model.update(tensor_data, batch_id)
         
         if success:
             # Save batch metadata to database
@@ -225,7 +304,8 @@ async def process_batch_background(model: FastRoLSHsampler, tensor_data: torch.T
                 await conn.execute(
                     """INSERT INTO batches (dataset_id, batch_id, size, features_hash) 
                        VALUES ($1, $2, $3, $4)""",
-                    model.dataset_id, batch_id, len(tensor_data), data_hash
+                    model.dataset_id if hasattr(model, 'dataset_id') else None, 
+                    batch_id, len(tensor_data), data_hash
                 )
             
             logger.info(f"Batch {batch_id} processed successfully for dataset {dataset_name}")
@@ -247,8 +327,11 @@ async def query_neighbors(request: QueryRequest):
         # Convert queries to tensor
         queries_tensor = torch.tensor(request.queries, dtype=torch.float32)
         
-        # Execute batched query
-        results = await model.batched_query(queries_tensor, request.k)
+        # Execute query based on model type
+        if isinstance(model, FastRoLSHsampler):
+            results = await model.batched_query(queries_tensor, request.k)
+        else:  # UnifiedQuantizationEngine
+            results = await model.query(queries_tensor, request.k)
         
         return {"results": results}
     except Exception as e:
@@ -264,12 +347,42 @@ async def sample_data(request: SampleRequest):
             raise HTTPException(status_code=404, detail="Dataset not found or model not initialized")
         
         # Execute sampling
-        indices, weights = await model.sample(
-            strategy=request.strategy,
-            size=request.size
-        )
+        if isinstance(model, FastRoLSHsampler):
+            indices, weights = await model.sample(
+                strategy=request.strategy,
+                size=request.size
+            )
+        else:  # UnifiedQuantizationEngine
+            indices, weights = await model.sample(
+                strategy=request.strategy,
+                size=request.size
+            )
         
         return {"indices": indices, "weights": weights}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/quantization/train/")
+async def train_quantization(request: QuantizationTrainRequest):
+    """Train quantization model on existing data"""
+    try:
+        # Get model for the specified dataset
+        model = models.get(request.dataset_name)
+        if model is None:
+            raise HTTPException(status_code=404, detail="Dataset not found or model not initialized")
+        
+        # Check if model supports quantization training
+        if not hasattr(model, 'train_pq'):
+            raise HTTPException(status_code=400, detail="Model does not support quantization training")
+        
+        # Train quantization
+        success = await model.train_pq()
+        
+        if success:
+            return {"message": "Quantization model trained successfully"}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to train quantization model")
+            
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -278,7 +391,7 @@ async def list_datasets(conn=Depends(get_db_connection)):
     """List all datasets in the system"""
     try:
         # Query all datasets from database
-        datasets = await conn.fetch("SELECT id, name, dimension, m, k, L, w, distance_metric, initial_radius, radius_expansion, sampling_ratio, created_at FROM datasets ORDER BY created_at DESC")
+        datasets = await conn.fetch("SELECT id, name, dimension, m, k, L, w, distance_metric, initial_radius, radius_expansion, sampling_ratio, quantization_method, pq_num_subspaces, pq_num_clusters, pq_use_diffusion, created_at FROM datasets ORDER BY created_at DESC")
         return [dict(dataset) for dataset in datasets]
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -293,7 +406,11 @@ async def get_model_state(dataset_name: str):
             raise HTTPException(status_code=404, detail="Model not found")
         
         # Get model statistics
-        stats = await model.get_stats()
+        if isinstance(model, FastRoLSHsampler):
+            stats = await model.get_stats()
+        else:  # UnifiedQuantizationEngine
+            stats = await model.get_stats()
+        
         return stats
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -311,7 +428,11 @@ async def save_model(request: ModelSaveRequest):
         os.makedirs(os.path.dirname(request.filepath), exist_ok=True)
         
         # Save model state
-        success = model.save_state(request.filepath)
+        if isinstance(model, FastRoLSHsampler):
+            success = model.save_state(request.filepath)
+        else:  # UnifiedQuantizationEngine
+            success = model.save_state(request.filepath)
+        
         if success:
             return {"message": "Model saved successfully", "filepath": request.filepath}
         else:
@@ -325,7 +446,7 @@ async def load_model(request: ModelSaveRequest, conn=Depends(get_db_connection))
     try:
         # Get dataset information from database
         dataset = await conn.fetchrow(
-            "SELECT id, dimension, m, k, L, w, distance_metric, initial_radius, radius_expansion, sampling_ratio FROM datasets WHERE name = $1", 
+            "SELECT id, name, dimension, m, k, L, w, distance_metric, initial_radius, radius_expansion, sampling_ratio, quantization_method, pq_num_subspaces, pq_num_clusters, pq_use_diffusion FROM datasets WHERE name = $1", 
             request.dataset_name
         )
         
@@ -334,23 +455,52 @@ async def load_model(request: ModelSaveRequest, conn=Depends(get_db_connection))
         
         # Create or get model instance
         if request.dataset_name not in models:
-            models[request.dataset_name] = FastRoLSHsampler(
-                d=dataset['dimension'],
-                m=dataset['m'],
-                k=dataset['k'],
-                L=dataset['L'],
-                w=dataset['w'],
-                dataset_id=dataset['id'],
-                dataset_name=request.dataset_name,
-                db_pool=db_pool,
-                distance_metric=dataset['distance_metric'],
-                initial_radius=dataset['initial_radius'],
-                radius_expansion=dataset['radius_expansion'],
-                sampling_ratio=dataset['sampling_ratio']
-            )
+            if dataset['quantization_method'] == 'lsh':
+                models[request.dataset_name] = FastRoLSHsampler(
+                    d=dataset['dimension'],
+                    m=dataset['m'],
+                    k=dataset['k'],
+                    L=dataset['L'],
+                    w=dataset['w'],
+                    dataset_id=dataset['id'],
+                    dataset_name=request.dataset_name,
+                    db_pool=db_pool,
+                    distance_metric=dataset['distance_metric'],
+                    initial_radius=dataset['initial_radius'],
+                    radius_expansion=dataset['radius_expansion'],
+                    sampling_ratio=dataset['sampling_ratio']
+                )
+            else:
+                # Create unified quantization engine
+                unified_config = UnifiedConfig(
+                    m=dataset['m'],
+                    k=dataset['k'],
+                    L=dataset['L'],
+                    w=dataset['w'],
+                    distance_metric=dataset['distance_metric'],
+                    initial_radius=dataset['initial_radius'],
+                    radius_expansion=dataset['radius_expansion'],
+                    sampling_ratio=dataset['sampling_ratio'],
+                    pq_num_subspaces=dataset['pq_num_subspaces'],
+                    pq_num_clusters=dataset['pq_num_clusters'],
+                    pq_use_diffusion=dataset['pq_use_diffusion'],
+                    hybrid_mode='hybrid' if dataset['quantization_method'] == 'hybrid' else 'pq_only'
+                )
+                
+                models[request.dataset_name] = UnifiedQuantizationEngine(
+                    d=dataset['dimension'],
+                    config=unified_config,
+                    dataset_id=dataset['id'],
+                    dataset_name=request.dataset_name,
+                    db_pool=db_pool
+                )
         
         # Load model state from file
-        success = models[request.dataset_name].load_state(request.filepath)
+        if isinstance(models[request.dataset_name], FastRoLSHsampler):
+            success = models[request.dataset_name].load_state(request.filepath)
+        else:  # UnifiedQuantizationEngine
+            success = models[request.dataset_name].load_state(request.filepath)
+        
         if success:
             return {"message": "Model loaded successfully", "filepath": request.filepath}
         else:
@@ -364,7 +514,7 @@ async def get_dataset_info(dataset_name: str, conn=Depends(get_db_connection)):
     try:
         # Get dataset information from database
         dataset = await conn.fetchrow(
-            "SELECT id, name, dimension, m, k, L, w, distance_metric, initial_radius, radius_expansion, sampling_ratio, created_at FROM datasets WHERE name = $1",
+            "SELECT id, name, dimension, m, k, L, w, distance_metric, initial_radius, radius_expansion, sampling_ratio, quantization_method, pq_num_subspaces, pq_num_clusters, pq_use_diffusion, created_at FROM datasets WHERE name = $1",
             dataset_name
         )
         
@@ -377,10 +527,18 @@ async def get_dataset_info(dataset_name: str, conn=Depends(get_db_connection)):
             dataset['id']
         )
         
+        # Get model statistics if available
+        model_stats = {}
+        if dataset_name in models:
+            if isinstance(models[dataset_name], FastRoLSHsampler):
+                model_stats = await models[dataset_name].get_stats()
+            else:  # UnifiedQuantizationEngine
+                model_stats = await models[dataset_name].get_stats()
+        
         return {
             "dataset": dict(dataset),
             "batches": [dict(batch) for batch in batches],
-            "total_points": models[dataset_name].total_points if dataset_name in models else 0
+            "model_stats": model_stats
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -417,55 +575,22 @@ async def optimize_model_parameters(
         if model is None:
             raise HTTPException(status_code=404, detail="Model not found")
         
-        # Optimize parameters
-        result = await model.optimize_parameters(sample_size)
-        
-        # Update parameters in database
-        await conn.execute(
-            "UPDATE datasets SET w = $1, initial_radius = $2, updated_at = NOW() WHERE name = $3",
-            result.get('w', model.w),
-            result.get('initial_radius', model.initial_radius),
-            dataset_name
-        )
+        # Optimize parameters based on model type
+        if isinstance(model, FastRoLSHsampler):
+            result = await model.optimize_parameters(sample_size)
+            
+            # Update parameters in database
+            await conn.execute(
+                "UPDATE datasets SET w = $1, initial_radius = $2, updated_at = NOW() WHERE name = $3",
+                result.get('w', model.w),
+                result.get('initial_radius', model.initial_radius),
+                dataset_name
+            )
+        else:
+            # For unified engine, we need to implement optimization
+            result = {"message": "Parameter optimization not yet implemented for unified engine"}
         
         return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/model/update_parameters/{dataset_name}")
-async def update_model_parameters(
-    dataset_name: str,
-    w: Optional[float] = None,
-    initial_radius: Optional[float] = None,
-    sampling_ratio: Optional[float] = None,
-    conn=Depends(get_db_connection)
-):
-    """Manually update model parameters"""
-    try:
-        # Get model for the specified dataset
-        model = models.get(dataset_name)
-        if model is None:
-            raise HTTPException(status_code=404, detail="Model not found")
-        
-        # Update parameters if provided
-        if w is not None:
-            model.w = w
-        if initial_radius is not None:
-            model.initial_radius = initial_radius
-        if sampling_ratio is not None and 0 < sampling_ratio <= 1:
-            model.sampling_ratio = sampling_ratio
-            model.m_sampled = max(1, int(model.d * sampling_ratio))
-        
-        # Reinitialize hash functions with new parameters
-        model._init_hash_functions()
-        
-        # Update parameters in database
-        await conn.execute(
-            "UPDATE datasets SET w = $1, initial_radius = $2, sampling_ratio = $3, updated_at = NOW() WHERE name = $4",
-            model.w, model.initial_radius, model.sampling_ratio, dataset_name
-        )
-        
-        return {"message": "Parameters updated successfully"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

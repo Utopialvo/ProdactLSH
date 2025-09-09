@@ -29,28 +29,18 @@ class FastRoLSHTestClient:
     def create_dataset(self, name: str, dimension: int, m: int = 100, k: int = 10, L: int = 5, 
                       w: float = 1.0, distance_metric: str = "euclidean", 
                       initial_radius: Optional[float] = None, radius_expansion: float = 2.0,
-                      sampling_ratio: float = 0.1) -> Dict[str, Any]:
+                      sampling_ratio: float = 0.1, quantization_method: str = "lsh",
+                      pq_num_subspaces: int = 8, pq_num_clusters: int = 256, 
+                      pq_use_diffusion: bool = False) -> Dict[str, Any]:
         """
         Create a new dataset with custom parameters via the API.
-        
-        Args:
-            name: Unique name for the dataset
-            dimension: Dimensionality of the data vectors
-            m: Number of hash functions per table
-            k: Number of hash bits per function
-            L: Number of hash tables
-            w: Bucket width for Euclidean distance
-            distance_metric: Distance metric ('euclidean' or 'cosine')
-            initial_radius: Initial search radius for roLSH
-            radius_expansion: Radius expansion factor for roLSH
-            sampling_ratio: Feature sampling ratio for FastLSH
-            
-        Returns:
-            API response containing dataset creation result
         """
         # Validate distance metric
         if distance_metric not in ["euclidean", "cosine"]:
             raise ValueError("Distance metric must be 'euclidean' or 'cosine'")
+        
+        if quantization_method not in ["lsh", "pq", "hybrid"]:
+            raise ValueError("Quantization method must be 'lsh', 'pq', or 'hybrid'")
         
         # Make API request to create dataset
         url = f"{self.base_url}/datasets/"
@@ -64,7 +54,11 @@ class FastRoLSHTestClient:
             "distance_metric": distance_metric,
             "initial_radius": initial_radius,
             "radius_expansion": radius_expansion,
-            "sampling_ratio": sampling_ratio
+            "sampling_ratio": sampling_ratio,
+            "quantization_method": quantization_method,
+            "pq_num_subspaces": pq_num_subspaces,
+            "pq_num_clusters": pq_num_clusters,
+            "pq_use_diffusion": pq_use_diffusion
         }
         response = self.session.post(url, json=payload)
         response.raise_for_status()  # Raise exception for HTTP errors
@@ -73,14 +67,6 @@ class FastRoLSHTestClient:
     def process_batch(self, dataset_name: str, data: List[List[float]], batch_id: str = None) -> Dict[str, Any]:
         """
         Send a batch of data for processing via the API.
-        
-        Args:
-            dataset_name: Name of the dataset to add data to
-            data: List of data vectors to process
-            batch_id: Optional custom identifier for the batch
-            
-        Returns:
-            API response containing batch processing result
         """
         url = f"{self.base_url}/batches/"
         payload = {
@@ -95,14 +81,6 @@ class FastRoLSHTestClient:
     def query_neighbors(self, dataset_name: str, queries: List[List[float]], k: int = 10) -> Dict[str, Any]:
         """
         Query for nearest neighbors of given vectors via the API.
-        
-        Args:
-            dataset_name: Name of the dataset to query
-            queries: List of query vectors
-            k: Number of neighbors to return for each query
-            
-        Returns:
-            API response containing query results
         """
         url = f"{self.base_url}/query/"
         payload = {
@@ -117,14 +95,6 @@ class FastRoLSHTestClient:
     def sample_data(self, dataset_name: str, strategy: str = "proportional", size: int = 1000) -> Dict[str, Any]:
         """
         Sample data points using LSH-based sampling strategies via the API.
-        
-        Args:
-            dataset_name: Name of the dataset to sample from
-            strategy: Sampling strategy ('proportional' or 'balanced')
-            size: Number of samples to return
-            
-        Returns:
-            API response containing sampling results
         """
         url = f"{self.base_url}/sample/"
         payload = {
@@ -136,12 +106,23 @@ class FastRoLSHTestClient:
         response.raise_for_status()
         return response.json()
     
+    def train_quantization(self, dataset_name: str, method: str = "pq", use_diffusion: bool = False) -> Dict[str, Any]:
+        """
+        Train quantization model on existing data via the API.
+        """
+        url = f"{self.base_url}/quantization/train/"
+        payload = {
+            "dataset_name": dataset_name,
+            "method": method,
+            "use_diffusion": use_diffusion
+        }
+        response = self.session.post(url, json=payload)
+        response.raise_for_status()
+        return response.json()
+    
     def list_datasets(self) -> List[Dict[str, Any]]:
         """
         Get a list of all datasets in the system via the API.
-        
-        Returns:
-            List of dataset information dictionaries
         """
         url = f"{self.base_url}/datasets/"
         response = self.session.get(url)
@@ -151,12 +132,6 @@ class FastRoLSHTestClient:
     def get_model_state(self, dataset_name: str) -> Dict[str, Any]:
         """
         Get current state and statistics of a model via the API.
-        
-        Args:
-            dataset_name: Name of the dataset
-            
-        Returns:
-            Model state and statistics
         """
         url = f"{self.base_url}/model/state/{dataset_name}"
         response = self.session.get(url)
@@ -166,35 +141,30 @@ class FastRoLSHTestClient:
     def health_check(self) -> Dict[str, Any]:
         """
         Check health status of the API server and database connection.
-        
-        Returns:
-            Health status information
         """
         url = f"{self.base_url}/health"
         response = self.session.get(url)
         response.raise_for_status()
         return response.json()
-    
+        
     def wait_for_processing(self, dataset_name: str, expected_points: int, timeout: int = 30):
         """
         Wait for all batches to be processed by periodically checking model state.
-        
-        Args:
-            dataset_name: Name of the dataset to monitor
-            expected_points: Expected number of points after processing
-            timeout: Maximum time to wait in seconds
-            
-        Returns:
-            True if processing completed, False if timeout reached
         """
         start_time = time.time()
         while time.time() - start_time < timeout:
             try:
                 state = self.get_model_state(dataset_name)
-                if state['total_points'] >= expected_points:
-                    print(f"All batches processed. Points: {state['total_points']}/{expected_points}")
+                
+                # Handle different response formats
+                total_points = state.get('total_points', 0)
+                if not total_points and 'lsh_stats' in state:
+                    total_points = state['lsh_stats'].get('total_points', 0)
+                
+                if total_points >= expected_points:
+                    print(f"All batches processed. Points: {total_points}/{expected_points}")
                     return True
-                print(f"Waiting for processing... Points: {state['total_points']}/{expected_points}")
+                print(f"Waiting for processing... Points: {total_points}/{expected_points}")
                 time.sleep(1)
             except:
                 print("Error getting model state, retrying...")
@@ -206,17 +176,6 @@ class FastRoLSHTestClient:
                           n_classes: int = 3, n_informative: int = 5, distance_metric: str = "euclidean"):
         """
         Generate test data of different types for testing purposes.
-        
-        Args:
-            dataset_type: Type of data to generate ('classification', 'regression', or 'clustering')
-            n_samples: Number of samples to generate
-            n_features: Number of features for each sample
-            n_classes: Number of classes (for classification and clustering)
-            n_informative: Number of informative features
-            distance_metric: Distance metric to optimize for
-            
-        Returns:
-            Tuple of (data, labels) where data is a list of vectors and labels is a list of labels
         """
         # For all metrics, use standard data generation
         if dataset_type == "classification":
@@ -262,28 +221,19 @@ class FastRoLSHTestClient:
         raise ValueError(f"Unknown dataset type: {dataset_type}")
     
     def test_nearest_neighbors(self, dataset_name: str, n_samples: int = 1000, n_features: int = 10, 
-                              n_queries: int = 5, k: int = 5, distance_metric: str = "euclidean"):
+                              n_queries: int = 5, k: int = 5, distance_metric: str = "euclidean",
+                              quantization_method: str = "lsh"):
         """
         Test nearest neighbor search functionality with visualization.
-        
-        Args:
-            dataset_name: Name for the test dataset
-            n_samples: Number of samples to generate
-            n_features: Number of features for each sample
-            n_queries: Number of query points to test
-            k: Number of neighbors to find for each query
-            distance_metric: Distance metric to use
-            
-        Returns:
-            Dictionary containing test results
         """
         print(f"\n=== Testing nearest neighbor search for dataset: {dataset_name} ===")
         
         # Generate test data
         X, _ = self.generate_test_data("clustering", n_samples, n_features, distance_metric=distance_metric)
         
-        # Create dataset with specified distance metric
-        self.create_dataset(dataset_name, n_features, distance_metric=distance_metric)
+        # Create dataset with specified distance metric and quantization method
+        self.create_dataset(dataset_name, n_features, distance_metric=distance_metric, 
+                           quantization_method=quantization_method)
         
         # Split into batches and send
         batch_size = 200
@@ -297,6 +247,10 @@ class FastRoLSHTestClient:
         if not self.wait_for_processing(dataset_name, n_samples):
             return {"error": "Batch processing timeout"}
         
+        # For PQ and hybrid methods, train quantization
+        if quantization_method != 'lsh':
+            self.train_quantization(dataset_name, "pq")
+        
         # Generate test queries from the same data
         query_indices = np.random.choice(len(X), size=min(n_queries, len(X)), replace=False)
         query_data = [X[i] for i in query_indices]
@@ -308,13 +262,19 @@ class FastRoLSHTestClient:
         found_neighbors = sum(len(result) > 0 for result in query_response['results'])
         print(f"Found neighbors for {found_neighbors}/{n_queries} queries")
         
-        # Visualize results for 2D and 3D data
-        if n_features in [2, 3]:
-            self._visualize_neighbors(X, query_data, query_response, query_indices, dataset_name, n_features)
-        
         # Get model state
         state_response = self.get_model_state(dataset_name)
-        print(f"Model state: {state_response['total_points']} points, {len(state_response['batch_info'])} batches")
+        
+        # Handle different response formats
+        batch_info = state_response.get('batch_info', {})
+        if not batch_info and 'lsh_stats' in state_response:
+            batch_info = state_response['lsh_stats'].get('batch_info', {})
+            
+        total_points = state_response.get('total_points', 0)
+        if not total_points and 'lsh_stats' in state_response:
+            total_points = state_response['lsh_stats'].get('total_points', 0)
+        
+        print(f"Model state: {total_points} points, {len(batch_info)} batches")
         
         return {
             "query_results": query_response,
@@ -325,14 +285,6 @@ class FastRoLSHTestClient:
     def _visualize_neighbors(self, X, query_data, query_response, query_indices, dataset_name, n_features):
         """
         Visualize queries and found neighbors for 2D and 3D data.
-        
-        Args:
-            X: All data points
-            query_data: Query points
-            query_response: Query results from API
-            query_indices: Indices of query points in the dataset
-            dataset_name: Name of the dataset
-            n_features: Number of features (2 or 3 for visualization)
         """
         if n_features == 2:
             fig, ax = plt.subplots(figsize=(10, 8))
@@ -389,28 +341,19 @@ class FastRoLSHTestClient:
             plt.close()
     
     def test_clustering(self, dataset_name: str, n_samples: int = 1000, n_features: int = 10, 
-                       n_clusters: int = 3, sample_size: int = 300, distance_metric: str = "euclidean"):
+                       n_clusters: int = 3, sample_size: int = 300, distance_metric: str = "euclidean",
+                       quantization_method: str = "lsh"):
         """
         Test clustering on sampled data.
-        
-        Args:
-            dataset_name: Name for the test dataset
-            n_samples: Number of samples to generate
-            n_features: Number of features for each sample
-            n_clusters: Number of clusters to generate
-            sample_size: Number of samples to use for clustering
-            distance_metric: Distance metric to use
-            
-        Returns:
-            Dictionary containing clustering test results
         """
         print(f"\n=== Testing clustering for dataset: {dataset_name} ===")
         
         # Generate test data
         X, y_true = self.generate_test_data("clustering", n_samples, n_features, n_clusters, distance_metric=distance_metric)
         
-        # Create dataset with specified distance metric
-        self.create_dataset(dataset_name, n_features, distance_metric=distance_metric)
+        # Create dataset with specified distance metric and quantization method
+        self.create_dataset(dataset_name, n_features, distance_metric=distance_metric, 
+                           quantization_method=quantization_method)
         
         # Send data
         batch_size = 200
@@ -423,6 +366,10 @@ class FastRoLSHTestClient:
         # Wait for all batches to be processed
         if not self.wait_for_processing(dataset_name, n_samples):
             return {"error": "Batch processing timeout"}
+        
+        # For PQ and hybrid methods, train quantization
+        if quantization_method != 'lsh':
+            self.train_quantization(dataset_name, "pq")
         
         # Sample data
         sample_response = self.sample_data(dataset_name, "proportional", sample_size)
@@ -471,28 +418,19 @@ class FastRoLSHTestClient:
         }
     
     def test_classification(self, dataset_name: str, n_samples: int = 1000, n_features: int = 10, 
-                           n_classes: int = 3, sample_size: int = 300, distance_metric: str = "euclidean"):
+                           n_classes: int = 3, sample_size: int = 300, distance_metric: str = "euclidean",
+                           quantization_method: str = "lsh"):
         """
         Test classification on sampled data.
-        
-        Args:
-            dataset_name: Name for the test dataset
-            n_samples: Number of samples to generate
-            n_features: Number of features for each sample
-            n_classes: Number of classes to generate
-            sample_size: Number of samples to use for classification
-            distance_metric: Distance metric to use
-            
-        Returns:
-            Dictionary containing classification test results
         """
         print(f"\n=== Testing classification for dataset: {dataset_name} ===")
         
         # Generate test data
         X, y_true = self.generate_test_data("classification", n_samples, n_features, n_classes, distance_metric=distance_metric)
         
-        # Create dataset with specified distance metric
-        self.create_dataset(dataset_name, n_features, distance_metric=distance_metric)
+        # Create dataset with specified distance metric and quantization method
+        self.create_dataset(dataset_name, n_features, distance_metric=distance_metric, 
+                           quantization_method=quantization_method)
         
         # Send data
         batch_size = 200
@@ -505,6 +443,10 @@ class FastRoLSHTestClient:
         # Wait for all batches to be processed
         if not self.wait_for_processing(dataset_name, n_samples):
             return {"error": "Batch processing timeout"}
+        
+        # For PQ and hybrid methods, train quantization
+        if quantization_method != 'lsh':
+            self.train_quantization(dataset_name, "pq")
         
         # Sample data
         sample_response = self.sample_data(dataset_name, "proportional", sample_size)
@@ -551,27 +493,19 @@ class FastRoLSHTestClient:
         }
     
     def test_regression(self, dataset_name: str, n_samples: int = 1000, n_features: int = 10, 
-                       sample_size: int = 300, distance_metric: str = "euclidean"):
+                       sample_size: int = 300, distance_metric: str = "euclidean",
+                       quantization_method: str = "lsh"):
         """
         Test regression on sampled data.
-        
-        Args:
-            dataset_name: Name for the test dataset
-            n_samples: Number of samples to generate
-            n_features: Number of features for each sample
-            sample_size: Number of samples to use for regression
-            distance_metric: Distance metric to use
-            
-        Returns:
-            Dictionary containing regression test results
         """
         print(f"\n=== Testing regression for dataset: {dataset_name} ===")
         
         # Generate test data
         X, y_true = self.generate_test_data("regression", n_samples, n_features, distance_metric=distance_metric)
         
-        # Create dataset with specified distance metric
-        self.create_dataset(dataset_name, n_features, distance_metric=distance_metric)
+        # Create dataset with specified distance metric and quantization method
+        self.create_dataset(dataset_name, n_features, distance_metric=distance_metric, 
+                           quantization_method=quantization_method)
         
         # Send data
         batch_size = 200
@@ -584,6 +518,10 @@ class FastRoLSHTestClient:
         # Wait for all batches to be processed
         if not self.wait_for_processing(dataset_name, n_samples):
             return {"error": "Batch processing timeout"}
+        
+        # For PQ and hybrid methods, train quantization
+        if quantization_method != 'lsh':
+            self.train_quantization(dataset_name, "pq")
         
         # Sample data
         sample_response = self.sample_data(dataset_name, "proportional", sample_size)
@@ -633,14 +571,6 @@ class FastRoLSHTestClient:
                                 sampled_indices, dataset_name):
         """
         Visualize clustering results for 2D data.
-        
-        Args:
-            X: All data points
-            y_true: True labels
-            labels_full: Labels from clustering on full data
-            labels_all_from_sample: Labels from clustering on all data using model trained on sample
-            sampled_indices: Indices of sampled points
-            dataset_name: Name of the dataset
         """
         fig, axes = plt.subplots(2, 2, figsize=(12, 10))
         
@@ -670,9 +600,6 @@ class FastRoLSHTestClient:
     def test_different_metrics(self):
         """
         Test the system with different distance metrics.
-        
-        Returns:
-            Dictionary containing test results for different metrics
         """
         print("\n=== Testing different distance metrics ===")
         
@@ -720,9 +647,6 @@ class FastRoLSHTestClient:
     def test_different_parameters(self):
         """
         Test the system with different LSH parameters.
-        
-        Returns:
-            Dictionary containing test results for different parameters
         """
         print("\n=== Testing different LSH parameters ===")
         
@@ -815,14 +739,73 @@ class FastRoLSHTestClient:
         
         return optimization_result
     
+    def test_quantization_methods(self):
+        """
+        Test different quantization methods on the same data.
+        """
+        print("\n=== Testing different quantization methods ===")
+        
+        timestamp = int(time.time())
+        results = {}
+        
+        # Test different quantization methods
+        methods = [
+            {"name": "lsh_only", "quantization_method": "lsh"},
+            {"name": "pq_only", "quantization_method": "pq"},
+            {"name": "hybrid", "quantization_method": "hybrid"}
+        ]
+        
+        for method in methods:
+            print(f"\n--- Testing method: {method['name']} ---")
+            
+            # Generate data
+            X, y_true = self.generate_test_data("clustering", 1000, 10, 3)
+            
+            # Create dataset with specified method
+            dataset_name = f"test_method_{method['name']}_{timestamp}"
+            self.create_dataset(
+                dataset_name, 10, 
+                quantization_method=method['quantization_method'],
+                pq_num_subspaces=8,
+                pq_num_clusters=256
+            )
+            
+            # Send data
+            batch_size = 200
+            for i in range(0, len(X), batch_size):
+                batch_data = X[i:i+batch_size]
+                self.process_batch(dataset_name, batch_data, f"batch_{i//batch_size}")
+            
+            # Wait for processing
+            if not self.wait_for_processing(dataset_name, len(X)):
+                results[method['name']] = {"error": "Batch processing timeout"}
+                continue
+            
+            # For PQ and hybrid methods, train quantization
+            if method['quantization_method'] != 'lsh':
+                self.train_quantization(dataset_name, "pq")
+            
+            # Query neighbors
+            query_indices = np.random.choice(len(X), size=5, replace=False)
+            query_data = [X[i] for i in query_indices]
+            
+            query_response = self.query_neighbors(dataset_name, query_data, 5)
+            found_neighbors = sum(len(result) > 0 for result in query_response['results'])
+            
+            results[method['name']] = {
+                "found_neighbors_ratio": found_neighbors / 5,
+                "query_results": query_response
+            }
+            
+            print(f"Method {method['name']}: found neighbors for {found_neighbors}/5 queries")
+        
+        return results
+    
     def run_comprehensive_test(self):
         """
         Run a comprehensive test of all system functions.
-        
-        Returns:
-            Dictionary containing comprehensive test results
         """
-        print("Starting comprehensive test of FastRoLSH system")
+        print("Starting comprehensive test of FastRoLSH system with Product Quantization")
         
         # Check server health
         try:
@@ -835,36 +818,41 @@ class FastRoLSHTestClient:
         # Generate unique dataset names
         timestamp = int(time.time())
         
-        # Test nearest neighbor search
-        nn_results = self.test_nearest_neighbors(f"test_nn_dataset_{timestamp}", 
-                                                n_samples=1000, n_features=10)
+        # Test different quantization methods
+        quantization_results = self.test_quantization_methods()
         
-        # Test clustering
-        clustering_results = self.test_clustering(f"test_clustering_dataset_{timestamp}", 
-                                                n_samples=1000, n_features=2, n_clusters=3)
+        # Test nearest neighbor search with hybrid method
+        nn_results = self.test_nearest_neighbors(f"test_nn_hybrid_{timestamp}", 
+                                                n_samples=1000, n_features=10,
+                                                quantization_method="hybrid")
         
-        # Test classification
-        classification_results = self.test_classification(f"test_classification_dataset_{timestamp}", 
-                                                        n_samples=1000, n_features=10, n_classes=3)
+        # Test clustering with PQ method
+        clustering_results = self.test_clustering(f"test_clustering_pq_{timestamp}", 
+                                                n_samples=1000, n_features=2, n_clusters=3,
+                                                quantization_method="pq")
         
-        # Test regression
-        regression_results = self.test_regression(f"test_regression_dataset_{timestamp}", 
-                                                n_samples=1000, n_features=10)
+        # Test classification with hybrid method
+        classification_results = self.test_classification(f"test_classification_hybrid_{timestamp}", 
+                                                        n_samples=1000, n_features=10, n_classes=3,
+                                                        quantization_method="hybrid")
         
-        # Test different metrics
-        metrics_results = self.test_different_metrics()
-        
-        # Test different parameters
-        params_results = self.test_different_parameters()
-        
-        # Test parameter optimization
-        optimization_results = self.test_parameter_optimization(f"test_optimization_dataset_{timestamp}",
-                                                               n_samples=1000, n_features=10)
+        # Test regression with PQ method
+        regression_results = self.test_regression(f"test_regression_pq_{timestamp}", 
+                                                n_samples=1000, n_features=10,
+                                                quantization_method="pq")
         
         # Results summary
         print("\n" + "="*50)
         print("TEST RESULTS SUMMARY")
         print("="*50)
+        
+        # Quantization methods results
+        print("\n--- Quantization methods results ---")
+        for method, result in quantization_results.items():
+            if "error" in result:
+                print(f"{method}: ERROR - {result['error']}")
+            else:
+                print(f"{method}: {result['found_neighbors_ratio']*100:.1f}% queries found neighbors")
         
         if "error" in nn_results:
             print(f"Nearest neighbors test: ERROR - {nn_results['error']}")
@@ -890,37 +878,12 @@ class FastRoLSHTestClient:
             print(f"Regression test - MSE Full data: {regression_results['mse_full']:.4f}")
             print(f"Regression test - MSE Sampled data: {regression_results['mse_sample']:.4f}")
         
-        # Metrics test results
-        print("\n--- Distance metrics test results ---")
-        for metric, result in metrics_results.items():
-            if "error" in result:
-                print(f"Metric {metric}: ERROR - {result['error']}")
-            else:
-                print(f"Metric {metric}: {result['found_neighbors_ratio']*100:.1f}% queries found neighbors")
-        
-        # Parameters test results
-        print("\n--- LSH parameters test results ---")
-        for params, result in params_results.items():
-            if "error" in result:
-                print(f"Parameters {params}: ERROR - {result['error']}")
-            else:
-                print(f"Parameters {params}: {result['found_neighbors_ratio']*100:.1f}% queries found neighbors")
-        
-        # Parameter optimization results
-        print("\n--- Parameter optimization results ---")
-        if "error" in optimization_results:
-            print(f"Parameter optimization: ERROR - {optimization_results['error']}")
-        else:
-            print(f"Parameter optimization: SUCCESS - w={optimization_results.get('w')}, initial_radius={optimization_results.get('initial_radius')}")
-        
         return {
+            "quantization_methods": quantization_results,
             "nearest_neighbors": nn_results,
             "clustering": clustering_results,
             "classification": classification_results,
-            "regression": regression_results,
-            "metrics": metrics_results,
-            "parameters": params_results,
-            "optimization": optimization_results
+            "regression": regression_results
         }
 
 # Example usage

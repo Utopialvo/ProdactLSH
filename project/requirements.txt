@@ -9,3 +9,9 @@ pydantic
 python-multipart
 aiofiles
 python-dotenv
+scikit-learn
+matplotlib
+plotly
+pandas
+seaborn
+ipywidgets
